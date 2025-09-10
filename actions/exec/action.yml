@@ -56,12 +56,48 @@ runs:
       set -ex -o pipefail
       [[ ! -z $log ]] && log=\"$log\"
 
+      # Start all commands in parallel and capture output
+      pids=()
+      outputs=()
       for container in $where; do
-        echo -e ::group::Executing on: $container
-        sudo podman exec                                 \
-          --user "$user"                                 \
-          --env "USER=$user"                             \
-          --workdir "$workdir"                           \
-          "$container" /bin/bash -c "$path" |& tee $log.$container
-        echo ::endgroup::
+        output_file=$(mktemp)
+        outputs+=("$container:$output_file")
+
+        (
+          sudo podman exec                                 \
+            --user "$user"                                 \
+            --env "USER=$user"                             \
+            --workdir "$workdir"                           \
+            "$container" /bin/bash -c "$path" &> "$output_file"
+          echo $? > "$output_file.exit_code"
+        ) &
+        pids+=($!)
       done
+
+      # Wait for all parallel commands to complete
+      for pid in "${pids[@]}"; do
+        wait "$pid"
+      done
+
+      # Print outputs
+      overall_exit_code=0
+      for output_info in "${outputs[@]}"; do
+        container="${output_info%%:*}"
+        output_file="${output_info##*:}"
+        exit_code=`cat "$output_file.exit_code"`
+
+        echo -e "::group::Output from: $container (exit code: $exit_code)"
+        cat "$output_file"
+        echo "::endgroup::"
+
+        if [ ! -z $log ]; then
+          cat "$output_file" > "$log.$container"
+        fi
+
+        # Track overall exit code
+        if [ $exit_code -ne 0 ]; then
+          overall_exit_code=$exit_code
+        fi
+      done
+
+      exit $overall_exit_code
